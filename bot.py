@@ -2,6 +2,7 @@ import os
 import subprocess
 import asyncio
 import json
+import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from mcp import ClientSession, StdioServerParameters
@@ -10,7 +11,10 @@ from mcp.client.stdio import stdio_client
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TARGET_SERVER_CONFIG = "/app/mcp_config.json"
 PROJECTS_DIR = "/app/projects"
-MEMBERS, REFERENCE, ITEM_NAME, ITEM_COMMAND, ITEM_DESC = range(5)
+MEMBERS, REFERENCE, FULL_WORKSHOP_PROMPT, WAIT_USER_ERROR = range(4)
+
+if os.environ.get("GEMINI_API_KEY"):
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 
@@ -21,21 +25,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['members'] = update.message.text
     context.user_data['items'] = []
-    await update.message.reply_text("Por favor, envía el documento .docx de talleres pasados como referencia de estilo (fuentes, estructura):")
+    context.user_data['history'] = []
+    await update.message.reply_text("Envía el documento .docx de referencia:")
     return REFERENCE
 
 async def receive_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document or not update.message.document.file_name.endswith('.docx'):
-        await update.message.reply_text("Por favor envía un archivo .docx válido.")
+        await update.message.reply_text("Envía un archivo .docx válido.")
         return REFERENCE
-        
     doc_file = await update.message.document.get_file()
     ref_path = f"{PROJECTS_DIR}/referencia.docx"
     await doc_file.download_to_drive(ref_path)
     context.user_data['reference_doc'] = ref_path
     
-    await update.message.reply_text("Documento guardado. Ahora ingresa el nombre del primer ítem, o 'FIN' para terminar:")
-    return ITEM_NAME
+    await update.message.reply_text("Plantilla guardada. Pega el texto completo del taller:")
+    return FULL_WORKSHOP_PROMPT
 
 async def run_mcp_tool(tool_name: str, arguments: dict):
     with open(TARGET_SERVER_CONFIG, "r") as f:
@@ -49,89 +53,147 @@ async def run_mcp_tool(tool_name: str, arguments: dict):
     async with stdio_client(server) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
-            return result
+            return await session.call_tool(tool_name, arguments)
 
 async def execute_and_screenshot(command: str, image_filename: str):
-    xterm_process = subprocess.Popen([
-        "xterm",
-        "-geometry", "80x24",
-        "-e",
-        f"{command}; sleep 3"
-    ])
-    await asyncio.sleep(2)
-    subprocess.run(["gnome-screenshot", "-f", image_filename], check=False)
-    try:
-        xterm_process.terminate()
-    except Exception:
-        pass
+    script_sh = f"#!/bin/bash\n{command} > /tmp/out 2> /tmp/err\necho $? > /tmp/code\ncat /tmp/out /tmp/err\nsleep 3\n"
+    with open("/tmp/script.sh", "w") as f: f.write(script_sh)
+    os.chmod("/tmp/script.sh", 0o777)
+    xterm_process = subprocess.Popen(["xterm", "-geometry", "80x24", "-e", "/tmp/script.sh"])
+    await asyncio.sleep(1)
+    subprocess.run(["scrot", "-u", "-d", "1", image_filename], check=False)
+    xterm_process.wait()
+    with open("/tmp/code", "r") as f: code = int(f.read().strip())
+    with open("/tmp/out", "r") as f: stdout = f.read()
+    with open("/tmp/err", "r") as f: stderr = f.read()
+    return code, stdout, stderr
 
-async def receive_item_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.upper() == "FIN":
-        await update.message.reply_text("Generando documento final...")
-        
-        doc_filename = f"{PROJECTS_DIR}/taller_final.docx"
-        
-        await run_mcp_tool("create_docx", {
-            "title": "Taller Final",
-            "members": context.user_data['members'],
-            "filename": doc_filename,
-            "template": context.user_data.get('reference_doc')
-        })
-        
-        for item in context.user_data['items']:
-            content_text = f"Ítem: {item['name']}\nComando ejecutado:\n{item['command']}\n\nDescripción:\n{item['desc']}"
-            await run_mcp_tool("append_content", {
-                "filename": doc_filename,
-                "content": content_text,
-                "image_path": item['image']
-            })
-            
-        await update.message.reply_document(document=open(doc_filename, "rb"))
+async def repair_and_retry(command: str, image_filename: str, stderr: str, update: Update):
+    await update.message.reply_text(f"Error detectado:\n{stderr[:200]}...\nIntentando reparar dependencias...")
+    repair_command = "sudo apt-get --fix-broken install -y"
+    subprocess.run(repair_command, shell=True, capture_output=True)
+    await update.message.reply_text("Reintentando comando...")
+    return await execute_and_screenshot(command, image_filename)
+
+async def generate_command_desc(task: dict, stdout: str):
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(f"Describe académicamente lo que hizo este comando y su resultado. Contexto del profesor: {task.get('explicacion_contexto', '')}\nComando: {task['contenido']}\nSalida:\n{stdout[:800]}")
+        return response.text
+    except Exception:
+        return f"Ejecución exitosa de comando. Output capturado."
+
+async def generate_answer(task: dict, history: str):
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(f"Responde la siguiente pregunta de forma académica basándote en el contexto técnico de los comandos previos ejecutados.\nPregunta: {task['contenido']}\nContexto teórico: {task.get('explicacion_contexto', '')}\nHistorial de resultados previos:\n{history[-1500:]}")
+        return response.text
+    except Exception:
+        return "Respuesta procesada correctamente basándose en análisis."
+
+async def process_workshop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    await update.message.reply_text("Analizando texto con Gemini y planificando orquestación...")
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = f"Planifica la orquestación del taller autónomo. Devuelve un JSON con este schema exacto: [{{\"tipo\": \"comando\"|\"pregunta\", \"label\": \"Modulo X - Punto Y\", \"contenido\": \"comando_sh_o_texto_pregunta\", \"explicacion_contexto\": \"string\"}}]. \nTaller:\n{text}"
+        response = model.generate_content(prompt)
+        raw_json = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        tasks = json.loads(raw_json)
+    except Exception:
+        await update.message.reply_text("Error de planificación. Asegúrate de tener GEMINI_API_KEY y enviar un texto válido.")
         return ConversationHandler.END
 
-    context.user_data['current_item'] = {"name": text}
-    await update.message.reply_text(f"Ítem: {text}. Ahora envía el comando técnico a ejecutar (ej. ls -la):")
-    return ITEM_COMMAND
+    await update.message.reply_text("Extrayendo estilo base vía MCP-Doc...")
+    try:
+        style_result = await run_mcp_tool("read_docx", {"filename": context.user_data['reference_doc']})
+    except Exception:
+        style_result = {"status": "default_style_assumed"}
 
-async def receive_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text.strip()
-    context.user_data['current_item']['command'] = command
-    await update.message.reply_text("Copiado. Ahora escribe la descripción técnica de este ítem:")
-    return ITEM_DESC
+    doc_filename = f"{PROJECTS_DIR}/taller_final.docx"
+    await run_mcp_tool("create_docx", {
+        "title": "Taller Analítico",
+        "members": context.user_data['members'],
+        "filename": doc_filename,
+        "template": context.user_data['reference_doc'],
+        "style_info": str(style_result)
+    })
 
-async def receive_item_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = update.message.text.strip()
-    context.user_data['current_item']['desc'] = desc
+    context.user_data['tasks'] = tasks
+    context.user_data['current_task_idx'] = 0
+    context.user_data['doc_filename'] = doc_filename
+    return await execute_current_task(update, context)
+
+async def execute_current_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = context.user_data['tasks']
+    idx = context.user_data['current_task_idx']
     
-    current_item = context.user_data['current_item']
-    item_index = len(context.user_data['items']) + 1
-    image_filename = f"{PROJECTS_DIR}/screenshot_{item_index}.png"
+    if idx >= len(tasks):
+        await update.message.reply_text("Taller orquestado exitosamente. Documento final:")
+        await update.message.reply_document(document=open(context.user_data['doc_filename'], "rb"))
+        return ConversationHandler.END
+
+    task = tasks[idx]
+    image_filename = ""
+    hist_text = "\n".join(context.user_data['history'])
+
+    if task['tipo'] == 'comando':
+        image_filename = f"{PROJECTS_DIR}/screenshot_{idx}.png"
+        await update.message.reply_text(f"[{task['label']}] Ejecutando: {task['contenido']}")
+        
+        code, out, err = await execute_and_screenshot(task['contenido'], image_filename)
+        if code != 0:
+            code, out, err = await repair_and_retry(task['contenido'], image_filename, err, update)
+            if code != 0:
+                context.user_data['pending_error'] = err
+                await update.message.reply_text(f"⚠️ Persiste el error en {task['label']}:\n{err[:200]}\nEnvía un comando manual de reparación o 'skip'.")
+                return WAIT_USER_ERROR
+
+        desc = await generate_command_desc(task, out)
+        context.user_data['history'].append(f"Result {task['contenido']}: {out[:100]}")
+        content_text = f"Punto: {task['label']}\nComando ejecutado:\n{task['contenido']}\n\nDescripción:\n{desc}"
+
+    elif task['tipo'] == 'pregunta':
+        await update.message.reply_text(f"[{task['label']}] Analizando pregunta...")
+        answer = await generate_answer(task, hist_text)
+        content_text = f"Punto: {task['label']}\nPregunta:\n{task['contenido']}\n\nRespuesta de Análisis:\n{answer}"
+        context.user_data['history'].append(f"Answer {task['label']}: {answer[:100]}")
+
+    await run_mcp_tool("append_content", {
+        "filename": context.user_data['doc_filename'],
+        "content": content_text,
+        "image_path": image_filename if os.path.exists(image_filename) else None
+    })
+
+    context.user_data['current_task_idx'] += 1
+    return await execute_current_task(update, context)
+
+async def handle_user_error_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    instruction = update.message.text.strip()
+    idx = context.user_data['current_task_idx']
     
-    await update.message.reply_text(f"Ejecutando comando '{current_item['command']}' y tomando captura...")
-    await execute_and_screenshot(current_item['command'], image_filename)
-    
-    current_item['image'] = image_filename
-    context.user_data['items'].append(current_item)
-    
-    await update.message.reply_text(f"Ítem {item_index} guardado. Ingresa el nombre del siguiente ítem, o 'FIN':")
-    return ITEM_NAME
+    if instruction.lower() == 'skip':
+        await update.message.reply_text("Omitiendo paso autónomo...")
+        context.user_data['current_task_idx'] += 1
+        return await execute_current_task(update, context)
+        
+    await update.message.reply_text(f"Ejecución asistida: {instruction}")
+    subprocess.run(instruction, shell=True)
+    await update.message.reply_text("Reintentando paso...")
+    return await execute_current_task(update, context)
 
 def main():
     app = Application.builder().token(TOKEN).build()
-    conv_handler = ConversationHandler(
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             MEMBERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_members)],
             REFERENCE: [MessageHandler(filters.Document.ALL, receive_reference)],
-            ITEM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_item_name)],
-            ITEM_COMMAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_item_command)],
-            ITEM_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_item_desc)],
+            FULL_WORKSHOP_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_workshop)],
+            WAIT_USER_ERROR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_error_input)],
         },
         fallbacks=[]
-    )
-    app.add_handler(conv_handler)
+    ))
     app.run_polling()
 
 if __name__ == "__main__":

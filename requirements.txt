@@ -2,3 +2,4 @@ python-telegram-bot
 mcp
 fastmcp
 python-docx
+google-generativeai
