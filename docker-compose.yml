@@ -3,9 +3,10 @@ version: '3.8'
 services:
   agent-bot:
     build: .
+    env_file:
+      - .env
     environment:
       - DISPLAY=${DISPLAY}
-      - TELEGRAM_TOKEN=7993708225:AAFdwelBBJUvKPFPUydFXP7RYXnkqPnH_Aw
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - ./projects:/app/projects
