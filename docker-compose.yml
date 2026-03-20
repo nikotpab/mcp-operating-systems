@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  agent-bot:
+    build: .
+    environment:
+      - DISPLAY=${DISPLAY}
+      - TELEGRAM_TOKEN=7993708225:AAFdwelBBJUvKPFPUydFXP7RYXnkqPnH_Aw
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./projects:/app/projects
+      - ./mcp_config.json:/app/mcp_config.json
+    network_mode: "host"
