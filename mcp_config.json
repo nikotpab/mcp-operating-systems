@@ -2,7 +2,7 @@
   "mcpServers": {
     "mcp-doc": {
       "command": "python",
-      "args": ["-m", "fastmcp", "run", "/app/MCP-Doc/main.py"]
+      "args": ["-m", "fastmcp", "run", "./MCP-Doc/main.py"]
     }
   }
 }

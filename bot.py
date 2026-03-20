@@ -3,14 +3,18 @@ import subprocess
 import asyncio
 import json
 import google.generativeai as genai
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Cargar variables locales de .env
+load_dotenv()
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TARGET_SERVER_CONFIG = "/app/mcp_config.json"
-PROJECTS_DIR = "/app/projects"
+TARGET_SERVER_CONFIG = "./mcp_config.json"
+PROJECTS_DIR = "./projects"
 MEMBERS, REFERENCE, FULL_WORKSHOP_PROMPT, WAIT_USER_ERROR = range(4)
 
 if os.environ.get("GEMINI_API_KEY"):
@@ -56,22 +60,54 @@ async def run_mcp_tool(tool_name: str, arguments: dict):
             return await session.call_tool(tool_name, arguments)
 
 async def execute_and_screenshot(command: str, image_filename: str):
-    script_sh = f"#!/bin/bash\n{command} > /tmp/out 2> /tmp/err\necho $? > /tmp/code\ncat /tmp/out /tmp/err\nsleep 3\n"
-    with open("/tmp/script.sh", "w") as f: f.write(script_sh)
-    os.chmod("/tmp/script.sh", 0o777)
-    xterm_process = subprocess.Popen(["xterm", "-geometry", "80x24", "-e", "/tmp/script.sh"])
-    await asyncio.sleep(1)
-    subprocess.run(["scrot", "-u", "-d", "1", image_filename], check=False)
-    xterm_process.wait()
-    with open("/tmp/code", "r") as f: code = int(f.read().strip())
-    with open("/tmp/out", "r") as f: stdout = f.read()
-    with open("/tmp/err", "r") as f: stderr = f.read()
+    # Ensure previous temporary files are cleaned up
+    for f in ["/tmp/out", "/tmp/err", "/tmp/code"]:
+        if os.path.exists(f): os.remove(f)
+
+    # We escape double quotes for the AppleScript
+    safe_command = f"{command} > /tmp/out 2> /tmp/err; echo $? > /tmp/code; sleep 3"
+    safe_command = safe_command.replace('"', '\\"')
+    
+    applescript = f'''
+    tell application "Terminal"
+        activate
+        do script "{safe_command}"
+    end tell
+    '''
+    # Run the apple script to open Terminal and run the command
+    subprocess.run(["osascript", "-e", applescript])
+    
+    # Wait until the execution finishes (the code file is written)
+    for _ in range(30):
+        if os.path.exists("/tmp/code"):
+            break
+        await asyncio.sleep(1)
+        
+    # Take a screenshot. Terminal should be the active focused window.
+    # We use screencapture -x (no sound). 
+    subprocess.run(["screencapture", "-x", image_filename], check=False)
+    
+    try:
+        with open("/tmp/code", "r") as f: code = int(f.read().strip())
+    except:
+        code = 1
+    
+    stdout = ""
+    stderr = ""
+    if os.path.exists("/tmp/out"):
+        with open("/tmp/out", "r") as f: stdout = f.read()
+    if os.path.exists("/tmp/err"):
+        with open("/tmp/err", "r") as f: stderr = f.read()
+        
     return code, stdout, stderr
 
 async def repair_and_retry(command: str, image_filename: str, stderr: str, update: Update):
-    await update.message.reply_text(f"Error detectado:\n{stderr[:200]}...\nIntentando reparar dependencias...")
-    repair_command = "sudo apt-get --fix-broken install -y"
+    await update.message.reply_text(f"Error detectado:\n{stderr[:200]}...\nIntentando reparar dependencias con brew...")
+    
+    # Try basic brew fixes or ask Gemini for a fix command. For now just generic brew update as dummy
+    repair_command = "brew update && brew upgrade"
     subprocess.run(repair_command, shell=True, capture_output=True)
+    
     await update.message.reply_text("Reintentando comando...")
     return await execute_and_screenshot(command, image_filename)
 
