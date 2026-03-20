@@ -1,0 +1,21 @@
+# Environments
+.env
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary System Files
+/tmp/
+*.png
+*.docx
+
+# Runtime Repositories and User Generation
+projects/
+MCP-Doc/
