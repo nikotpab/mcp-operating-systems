@@ -1,6 +1,6 @@
 python-telegram-bot
+google-generativeai
+python-docx
 mcp
 fastmcp
-python-docx
-google-generativeai
 python-dotenv
